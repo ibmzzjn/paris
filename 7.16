@@ -1,0 +1,915 @@
+package paris;
+
+import java.io.BufferedWriter;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.java.util.concurrent.NotifyingBlockingThreadPoolExecutor;
+import org.java.util.concurrent.ConcurrentHashSet;
+import org.java.util.concurrent.MapBackedSet;
+import paris.Config.EntityType;
+import paris.FactStore.Entity;
+import javatools.administrative.Announce;
+import javatools.administrative.Announce.Level;
+import javatools.administrative.D;
+import javatools.datatypes.CombinedIterable;
+import javatools.datatypes.MappedIterator;
+import javatools.datatypes.Pair;
+import javatools.datatypes.PeekIterator;
+import javatools.parsers.NumberFormatter;
+
+/** This class is part of the PARIS ontology matching project at INRIA Saclay/France.
+ * 
+ * It is licensed under a Creative Commons Attribution Non-Commercial License
+ * by the author Fabian M. Suchanek (http://suchanek.name). For all further information,
+ * see http://webdam.inria.fr/paris
+ *
+ * This class implements a very cool probabilistic framework for ontology matching
+ */
+public class Paris {
+
+  public final static int reportInterval = 1000;
+
+  /** TRUE for test runs*/
+  public static boolean test = false;
+
+  /** TRUE for debug on. Make it final to allow conditional compiling. */
+  public static boolean debug = false;
+  
+  /** If this file exists, we stop immediately*/
+  public static File stop = new File("stop").getAbsoluteFile();
+
+  /** First ontology*/
+  public static FactStore factStore1;
+
+  /** Second ontology*/
+  public static FactStore factStore2;
+
+  public static Set<Pair<Object,Object>> AI=new HashSet<Pair<Object,Object>>();
+  
+  public static Set<Pair<Object,Object>> Aunion=new HashSet<Pair<Object,Object>>();
+  
+  public static Set<Pair<Set<Integer>,Set<Integer>>> Candidateblocks=new HashSet<Pair<Set<Integer>,Set<Integer>>>();
+  
+  //public static Set<Pair<Object,Object>> k=new HashSet<Pair<Object,Object>>();
+  
+  /** Stores the equality */
+  public static Result computed;
+
+  /** Optimizer for finding equals*/
+  public static Statistics statistics = new Statistics();
+
+  /** The setting in which we work*/
+  public static Setting setting;
+
+  /** Finds the super classes of a class*/
+  public static void findSuperClassesOf(Integer subclass, FactStore subStore, FactStore superStore) {
+    // We ignore classes that contain practically all entities
+    if (subStore.entity(subclass).name.startsWith("owl:") || 
+        subStore.entity(subclass).name.equals("http://www.opengis.net/gml/_Feature")) return;
+    if (debug) Announce.debug("Computing superclasses of", subStore.lazyToString(subclass));
+
+    /*
+    // The following deduces whether a class is a subclass of another class
+    // by looking at the domains and ranges of relations.
+    // In practice, we do not do that.
+     
+    // Check the domains
+    Map<Integer, Double> domainSuperclassDegree = new TreeMap<Integer, Double>();
+    // maps each superclass d to      PROD r,s: 1-P(c<dom(r))*P(dom(s)<d)*P(r<s)
+    // since we assume r and c to live in the same ontology
+    // and s and d to live in the same ontology, this becomes
+    //  PROD r,s such that c<dom(r),dom(s)<d:   1-P(r<s)
+    for (Integer superclass : subStore.superclasses(subclass)) {
+      for (Integer subrelation : subStore.relationsWithDomain(superclass)) {
+        for (Integer superrelation : computed.superRelationsOf(subStore, subrelation)) {
+          Integer superdom = superStore.domain(superrelation);
+          if (superdom == null) continue;
+          double subrelscore = computed.subRelation(subStore, subrelation, superrelation);
+          if (subrelscore == -1 || subrelscore < SubThingStore.THRESHOLD) continue;
+          for (Integer supersuperclass : superStore.superclasses(superdom)) {
+            double val = domainSuperclassDegree.containsKey(supersuperclass) ? domainSuperclassDegree.get(supersuperclass) : 1;
+            val *= 1 - subrelscore;
+            domainSuperclassDegree.put(supersuperclass, val);
+          }
+        }
+      }
+    }
+    */
+
+    // maps each superclass d to
+    //   SUM x such that type(x,c):  1 - PROD y such that type(y,d): 1-P(x=y)
+    Map<Integer, Double> superclassDegree = new TreeMap<Integer, Double>();
+    // contains the value
+    //   # x such that type(x,c)    // no longer: and exists y: y=x and type(y,some class)
+    double normalizer = 0;
+    int counter = 0;
+    // Don't compute that for classes that are too far up in the hierarchy
+    //get instances of subStore
+    CombinedIterable<Integer> subInstances = subStore.instancesOf(subclass, 10000);
+    if (subInstances == null) return;
+    for (Integer subclassInstance : subInstances) {
+      if (debug && counter++ > 100) break;
+      if (debug) Announce.debug("   Looking at instance", subStore.lazyToString(subclassInstance));
+      // For each instance x of c...
+      boolean foundeqv = false;
+      Map<Integer, Double> membershipProduct = new TreeMap<Integer, Double>();
+      // maps each superclass d to
+      //     PROD y such that type(y,d): 1-P(x=y)
+      for (Pair<Object, Double> superclassInstancePair : computed.equalToScored(subStore, subclassInstance)) {
+        if (!(superclassInstancePair.first() instanceof Integer)) continue;
+        Integer superclassInstance = (Integer) superclassInstancePair.first();
+        double equality = superclassInstancePair.second();
+        if (debug) Announce.debug("     Is equal to", superStore.lazyToString(superclassInstance), equality);
+
+        if (equality < Config.THETA) continue;
+        for (Integer superClass : superStore.classesOf(superclassInstance)) {
+          double prod = membershipProduct.containsKey(superClass) ? membershipProduct.get(superClass) : 1;
+          if (debug) Announce.debug("        Scoring for", superStore.lazyToString(superClass), prod, 1 - equality * equality, prod * (1 - equality));
+          prod *= 1 - equality;
+          membershipProduct.put(superClass, prod);
+          foundeqv = true;
+        }
+      }
+      if (foundeqv) {
+        for (Integer superclass : membershipProduct.keySet()) {
+          D.addKeyValueDbl(superclassDegree, superclass, 1 - membershipProduct.get(superclass));
+        }
+      }
+      normalizer++;
+    }
+    close(subInstances);
+    // We do not do the domain/range deduction
+    // Collect all classes about which we know something in superclassDegree
+    // Say that if we have no instances, the superclassDegree is 0
+    //for (Integer superclass : domainSuperclassDegree.keySet()) {
+    //  if (!superclassDegree.containsKey(superclass)) superclassDegree.put(superclass, 0.0);
+    //}
+
+    // If the normalizer is 0, superclassDegree(x)=0 for all x. 
+    // So instanceScore will be 0 anyway. Hence, set the normalizer to 1
+    // to avoid NAN values when we compute superclassDegree(x)/normalizer.
+    if (normalizer == 0) normalizer = 1;
+
+    // Set the final values
+    for (Integer superclass : superclassDegree.keySet()) {
+      double instanceScore = superclassDegree.get(superclass) / normalizer;
+      double domainScore = 1.0; //domainSuperclassDegree.containsKey(superclass) ? domainSuperclassDegree.get(superclass) : 1.0;
+      if (1 - (1 - instanceScore) * domainScore < Config.THETA) continue;
+      if (debug) Announce.debug("Setting final value:", superStore.toString(superclass), superclassDegree.get(superclass), normalizer,
+          superclassDegree.get(superclass) / normalizer, 1 - (1 - instanceScore) * domainScore);
+      if (!test) computed.setSubclass(subStore, subclass, superclass, 1 - (1 - instanceScore) * domainScore);
+    }
+  }
+
+  /** Closes a closeable*/
+  public static void close(Closeable facts) {
+    try {
+      facts.close();
+    } catch (IOException e) {
+      e.printStackTrace();
+    }
+  }
+
+  /** Finds the super relations of a relation*/
+  public static void findSuperrelationsOf(Integer subrelation, FactStore subStore, FactStore superStore) {
+    if (subrelation < 0) return;
+    int counter = 0;
+    if (debug) Announce.debug("Computing super relations of", subStore.toString(subrelation));
+    // maps each superproperty s to 
+    //     SUM x,y such that r(x,y): 1 - PROD x2,y2 st s(x2,y2): 1-P(x=x2)*P(y=y2)
+    Map<Integer, Double> superPropScore = new TreeMap<Integer, Double>();
+    // holds the value
+    // //    # { x,y such that r(x,y) and exists x',y', z': x'=x, y'=y, r'(x',z') OR r'(z',y') }
+    //Map<Integer, Double> normalizer = new TreeMap<Integer, Double>();
+    double normalizer = 0;
+    MappedIterator<?, Pair<Object, Object>> facts = subStore.factsForRelation(subrelation);
+    // Holds the previous fact
+    Pair<Object, Object> previous = new Pair<Object, Object>("", "");
+    // Holds the x's to which x1 is equivalent with their scores
+    Collection<Pair<Object, Double>> x2s = null;
+    // Holds the y's to which y1 is equivalent with their scores
+    Collection<Pair<Object, Double>> y2s = null;
+    for (Pair<Object, Object> fact : facts) {
+      Object x1 = fact.first();
+      Object y1 = fact.second();
+      if (debug && (subStore.toString(x1).startsWith("y:wordnet") || subStore.toString(x1).startsWith("y:wikicategory"))) continue;
+      if (counter++ > 10000) break;
+      if (debug) Announce.debug("   Fact", subStore.toString(x1), subStore.toString(subrelation), subStore.toString(y1));
+      // holds the value
+      //     PROD x2,y2: 1-P(x1=x2)*P(y1=y2)
+      Map<Integer, Double> localSuperPropScore = new TreeMap<Integer, Double>();
+      // Find equivalent x2s and y2s
+      if (!previous.first().equals(x1) || x2s == null) x2s = computed.equalToScored(subStore, x1);
+      if (x2s.size() == 0) continue;
+      if (!previous.second().equals(y1) || y2s == null) y2s = computed.equalToScored(subStore, y1);
+      if (y2s.size() == 0) continue;
+      // For every matching pair...
+      for (Pair<Object, Double> x2sc : x2s) {
+        Object x2 = x2sc.first();
+        double xeqv = x2sc.second();
+        if (xeqv < Config.THETA) continue;
+        for (Pair<Object, Double> y2sc : y2s) {
+          Object y2 = y2sc.first();
+          double yeqv = y2sc.second();
+          if (yeqv < Config.THETA) continue;
+          if (debug) Announce.debug("       Matching x2=", superStore.toString(x2), xeqv);
+          if (debug) Announce.debug("       Matching y2", superStore.toString(y2), yeqv);
+          //for(Integer relation : superStore.relationsForArg1(x2)) {
+          //D.addKeyValueDbl(normalizer,relation,xeqv*yeqv);
+          //if (debug) Announce.debug("         Penalizing r", superStore.toString(relation), normalizer.get(relation));
+          //}
+          //formula (10)
+          normalizer += xeqv * yeqv;
+          Iterator<Integer> relations = superStore.relationsForArg1Arg2(x2, y2);
+          while (relations.hasNext()) {
+          	Integer superrelation = relations.next();
+            double val = localSuperPropScore.containsKey(superrelation) ? localSuperPropScore.get(superrelation) : 1.0;
+            if (debug) Announce.debug("         Match r=", superStore.toString(superrelation), "before=", val, "after=", val * (1 - xeqv * yeqv));
+            val *= 1 - xeqv * yeqv;
+            localSuperPropScore.put(superrelation, val);
+          }
+        }
+      }
+      for (Integer superrelation : localSuperPropScore.keySet()) {
+        Announce.debug("  ", superStore.toString(superrelation), superPropScore.get(superrelation), "+", 1 - localSuperPropScore.get(superrelation),
+            "=", (superPropScore.get(superrelation) == null ? 0 : superPropScore.get(superrelation)) + 1 - localSuperPropScore.get(superrelation));
+        D.addKeyValueDbl(superPropScore, superrelation, 1 - localSuperPropScore.get(superrelation));
+      }
+      previous = fact;
+    }
+    close(facts);
+    for (Integer superrelation : superPropScore.keySet()) {
+      if (debug) Announce.debug("Final set", superStore.toString(superrelation), superPropScore.get(superrelation), normalizer,
+          superPropScore.get(superrelation) / normalizer);
+      if (!test) 
+      	computed.setSubrelation(subStore, subrelation, superrelation, superPropScore.get(superrelation) / normalizer);
+    }
+  }
+
+  /** Reduces a map to the maximums*/
+  public static void reduceToMax(Map<Integer, Double> map) {
+    double max = -1;
+    for (Double val : map.values())
+      if (val > max) max = val;
+    Iterator<Integer> it = map.keySet().iterator();
+    while (it.hasNext()) {
+      if (map.get(it.next()) < max) it.remove();
+    }
+  }
+
+  /** Reduces a map to the minimums*/
+  public static void reduceToMin(Map<Integer, Double> map) {
+    double min = 2;
+    for (Double val : map.values())
+      if (val < min) min = val;
+    Iterator<Integer> it = map.keySet().iterator();
+    while (it.hasNext()) {
+      if (map.get(it.next()) > min) it.remove();
+    }
+  }
+
+  /** Reduces a map to one value with the minimum*/
+  public static void reduceToMinMin(Map<Integer, Double> map) {
+    if (map.isEmpty()) return;
+    double min = 2;
+    Integer key = null;
+    for (Integer v : map.keySet()) {
+      if (map.get(v) < min) {
+        key = v;
+        min = map.get(v);
+      }
+    }
+    map.clear();
+    map.put(key, min);
+  }
+
+  /** Reduces a map to one value with the maximum*/
+  public static void reduceToMaxMax(Map<Integer, Double> map) {
+    if (map.isEmpty()) return;
+    double max = -1;
+    Integer key = null;
+    for (Integer v : map.keySet()) {
+      if (map.get(v) > max) {
+        key = v;
+        max = map.get(v);
+      }
+    }
+    map.clear();
+    map.put(key, max);
+  }
+
+  public static void Block(Set<Integer> Ix, Set<Integer> Iy, Set<Pair<Object,Object>> k, int t){
+	  Iterator<Pair<Object,Object>> it=Aunion.iterator();
+	  while(it.hasNext()){		  
+		  Pair<Object,Object> itt=it.next();
+		  if(!k.contains(itt)){	
+			  Set<Integer> Jx=new HashSet<Integer>();
+			  Set<Integer> Jy=new HashSet<Integer>();
+			  if(factStore2.factsForArg2(itt.second())!=null){
+				  Iterator<Pair<Integer,Object>>e1=factStore2.factsForArg2(itt.second()).iterator();
+				  while(e1.hasNext()){
+					  Pair<Integer,Object> e2=e1.next();
+					  Object x2=e2.second();
+					  //if(x2 instanceof Integer){
+					  if(Iy.contains(x2))
+					      Jy.add((Integer) x2);
+					  //}
+				/*	  else if(factStore2.entity((String)x2)!=null){
+						  if(Iy.contains(factStore2.entity((String)x2).getId()))
+							  Jy.add(factStore2.entity((String)x2).getId());
+					  }
+					  */
+				  }
+			  }
+			  if(factStore1.factsForArg2(itt.first())!=null){
+				  Iterator<Pair<Integer,Object>>ee1=factStore1.factsForArg2(itt.first()).iterator();
+				  while(ee1.hasNext()){
+					  Pair<Integer,Object> ee2=ee1.next();
+					  Object x2=ee2.second();
+					  //if(x2 instanceof Integer){
+					  if(Ix.contains(x2))
+					  	  Jx.add((Integer) x2);
+					  //}
+				/*	  else if(factStore1.entity((String)x2)!=null){
+						  if(Ix.contains(factStore1.entity((String)x2).getId()))	
+							  Jx.add(factStore1.entity((String)x2).getId());
+					  }
+				*/	  
+				  }  
+			  }
+			  if(Jx.size()>t || Jy.size()>t){
+				  
+				  k.add(itt);
+				  Set<Pair<Object,Object>> kk=new HashSet<Pair<Object,Object>>();
+				  Set<Integer> Jxx=new HashSet<Integer>();
+				  Set<Integer> Jyy=new HashSet<Integer>();
+				  kk.addAll(k);
+				  Jxx.addAll(Jx);
+				  Jyy.addAll(Jy);
+				  Block(Jxx,Jyy,kk,t);
+				  k.remove(itt);
+				  //System.out.printf("2\n");
+			  }
+			  else if(Jx.size()>0 && Jy.size()>0){
+				  Candidateblocks.add(new Pair<Set<Integer>,Set<Integer>>(Jx,Jy));
+				  //System.out.printf("2");
+			  }
+		  }
+		  //Jx.clear();
+		  //Jy.clear();
+	  }
+  }
+  
+  
+  public static void CountAunion(){
+	  Set<Pair<Object,Object>> AL=new HashSet<Pair<Object,Object>>();
+	  Iterator<FactStore.Fact> e=factStore1.facts().iterator();
+	  while(e.hasNext()){
+		  FactStore.Fact ee=(FactStore.Fact) e.next();
+		  if(ee.arg2() instanceof String)
+			  AL.add(new Pair<Object,Object>(ee.arg2(),ee.arg2()));
+	  }
+	  Aunion.addAll(AL);
+	  Aunion.addAll(AI);
+  }
+  
+  
+  
+  /** Finds the equals of a resource*/
+  public static boolean findEqualsOf(Integer y1, boolean isFirstRun, AtomicBoolean someChanged,
+  		MemoryEqualityStore equalities, int labelid, int sameasid, int ifpid) {
+    if (debug) Announce.debug("Computing equality for", factStore1.lazyToString(y1));
+    
+    //Set<Integer> maxEqualities = computed.equalToMax(factStore1, y1);
+
+
+  
+    //same uri
+    String y1name=factStore1.entity(y1).toString();
+//    if(factStore2.entity("dbp:resource/" + y1name)!=null)   //same name
+//    	equalities.setValue(factStore1, y1, factStore2, factStore2.entity("dbp:resource/" + y1name).getId(), 1.0);
+
+    if(factStore2.entity(y1name)!=null){   //same name
+    	equalities.setValue(factStore1, y1, factStore2, factStore2.entity(y1name).getId(), 1.0);
+    	AI.add(new Pair<Object,Object>(y1,factStore2.entity(y1name).getId()));
+    }
+    
+/*    
+    //for any y1 in factstore1 as arg2 not null
+    if(factStore1.factsForArg2(y1)!=null){   
+    	Iterator <Pair<Integer,Object>> factp1= factStore1.factsForArg2(y1).iterator();  //get all facts in factstore1 where y1 appears as arg2
+    	Pair<Integer,Object> p1=factp1.next();
+    	if(!(factp1.hasNext())){       //y1 exists in only one fact in factstore1
+    		Object x1=p1.second();     //corresponding arg1
+    		if(factStore2.entity("dbp:resource/" + y1name)!=null){   //same name
+    			if(factStore2.factsForArg2(factStore2.entity("dbp:resource/" + y1name))!=null){//y1name as arg2 in factstore2 exists
+    				Iterator <Pair<Integer,Object>> factp2=factStore2.factsForArg2(factStore2.entity("dbp:resource/" + y1name).getId()).iterator();
+    				Pair<Integer,Object> p2=factp2.next();
+    				if(!(factp2.hasNext())){
+    					Object x2=p2.second();
+    					equalities.setValue(factStore1, (Integer)x1, factStore2, (Integer)x2, 1.0);
+    			
+    				}
+    			}		
+    		}
+    	}
+    }
+  */  
+    //Heuristical IFP
+    if(factStore1.factsForArg2(y1)!=null){   
+    	Iterator <Pair<Integer,Object>> factp1= factStore1.factsForArg2(y1).iterator();  //get all facts in factstore1 where y1 appears as arg2
+    	Pair<Integer,Object> p1=factp1.next();
+    	if(!(factp1.hasNext())){       //y1 exists in only one fact in factstore1
+    		Object x1=p1.second();     //corresponding arg1
+    		if(factStore2.entity(y1name)!=null){   //same name
+    			if(factStore2.factsForArg2(factStore2.entity(y1name))!=null){//y1name as arg2 in factstore2 exists
+    				Iterator <Pair<Integer,Object>> factp2=factStore2.factsForArg2(factStore2.entity(y1name).getId()).iterator();
+    				Pair<Integer,Object> p2=factp2.next();
+    				if(!(factp2.hasNext())){
+    					Object x2=p2.second();
+    					equalities.setValue(factStore1, (Integer)x1, factStore2, (Integer)x2, 1.0);
+    					AI.add(new Pair<Object,Object>((Integer)x1,(Integer)x2));
+    				}
+    			}		
+    		}
+    	}
+    }
+    
+    //same label
+    if(labelid!=-1){
+    	//if ee is an entity, object is int, otherwise it is string. 
+    	//For this situation, ee is always a string since arg2 for relation rdfs:label is always a literal.
+    	Collection<Object> e1=factStore1.arg2ForRelationAndArg1(labelid,y1);
+    	if(e1!=null){
+    		Iterator<Object> eit=e1.iterator();
+    		while(eit.hasNext()){
+    			Object ee=eit.next();
+    			if(ee instanceof String){
+    				int label2=factStore2.relation("rdfs:label").getId();
+    				for(Object eee:factStore2.arg1ForRelationAndArg2(label2,ee)){
+    					equalities.setValue(factStore1, y1, factStore2, (Integer)eee, 1.0);
+    					AI.add(new Pair<Object,Object>(y1,(Integer)eee));
+    				}
+    			}
+    		}
+    	}
+    }
+    
+    //sameas
+    if(sameasid!=-1){
+    	Integer eee=-1;
+    	Collection<Object> e1=factStore1.arg2ForRelationAndArg1(sameasid,y1);
+    	if(e1!=null){
+    		Iterator<Object> eit=e1.iterator();
+    		while(eit.hasNext()){
+    			Object ee=eit.next();
+    			if(factStore2.entity(factStore1.entity((Integer)ee).toString())!=null){
+    				eee=factStore2.entity(factStore1.entity((Integer)ee).toString()).getId();
+    			}
+    			if(eee!=-1){
+    				equalities.setValue(factStore1, y1, factStore2, eee, 1.0);
+    				AI.add(new Pair<Object,Object>(y1,eee));
+    			}
+    			eee=-1;
+    		}
+    	}	
+    }
+    	
+    	
+    
+    someChanged.set(true);
+    return true;
+    
+  }
+
+  private static class EntityComputer1 implements Runnable {
+	  	public EntityComputer1 () {
+	  	}
+	  	public void run() {
+	  		Set<Pair<Object,Object>> k=new HashSet<Pair<Object,Object>>();
+	  		Block(factStore1.getInstanceSet(),factStore2.getInstanceSet(),k,Config.t);
+	  		
+	  	}
+	  }
+  
+  private static class EntityComputer implements Runnable {
+  	AtomicBoolean foundEquality;
+  	AtomicBoolean someChanged;
+  	int v1;
+  	boolean isFirstRun;
+  	MemoryEqualityStore equalities;
+  	int labelid;
+  	int sameasid;
+  	int ifpid;
+  	//Set<Pair<Integer,Integer>> AI;
+  	
+  	public EntityComputer (AtomicBoolean foundEquality, 
+  			AtomicBoolean someChanged, int v1, boolean isFirstRun, MemoryEqualityStore equalities,int labelid,int sameasid,int ifpid) {
+  		this.foundEquality = foundEquality;
+  		this.someChanged = someChanged;
+  		this.v1 = v1;
+  		this.isFirstRun = isFirstRun;
+  		this.equalities = equalities;
+  		this.labelid=labelid;
+  		this.sameasid=sameasid;
+  		this.ifpid=ifpid;
+  		//this.AI=AI;
+  	}
+  	
+  	public void run() {
+  		if (findEqualsOf(v1, isFirstRun, someChanged, equalities,labelid,sameasid,ifpid))
+    		foundEquality.set(true);
+  	}
+  }
+  
+  /** Runs one whole iteration*/
+  public static boolean oneIteration(int run, int startAt) throws IOException {
+    if (stop.exists()) return (false);
+    
+    int num=0;
+    num++;
+    System.out.println(num);
+    
+    // Equality
+    statistics.reset();
+    int total = factStore1.numEntities() + 1;
+    int done = 0;
+    //numChanged = 0;
+    Announce.progressStart("Computing equality ", total - startAt);
+    boolean foundEquality = false;
+  	AtomicBoolean aFoundEquality = new AtomicBoolean();
+  	AtomicBoolean aSomeChanged = new AtomicBoolean();
+  	aFoundEquality.set(false);
+  	aSomeChanged.set(false);
+    NotifyingBlockingThreadPoolExecutor pool;
+    pool = null;
+    MemoryEqualityStore equalities = new MemoryEqualityStore();
+    
+    //Set<Pair<Integer,Integer>> AI=new HashSet<Pair<Integer,Integer>>();
+    
+    long timeStart = System.currentTimeMillis();
+    Announce.message("starting equalities at", NumberFormatter.ISOtime());
+    PeekIterator<Integer> entities = factStore1.entities();
+    
+    
+    
+    
+    if (setting.nThreads != 1) {
+      Announce.message("Spawning ", setting.nThreads, " threads");
+			pool = new NotifyingBlockingThreadPoolExecutor(
+					setting.nThreads, 2*setting.nThreads,
+					15, TimeUnit.SECONDS, 60, TimeUnit.MINUTES, null);
+    }
+    long start = System.currentTimeMillis();
+    
+    
+    int labelid;
+    int sameasid;
+    int ifpid;
+    if((factStore1.relation("rdfs:label"))!=null)
+    	labelid = factStore1.relation("rdfs:label").getId();
+    else
+    	labelid=-1;
+    if((factStore1.relation("Owl:sameAs"))!=null)
+    	sameasid = factStore1.relation("Owl:sameAs").getId();
+    else
+    	sameasid=-1;
+    if((factStore1.relation("Owl:InverseFunctionalProperty"))!=null)
+    	ifpid = factStore1.relation("Owl:InverseFunctionalProperty").getId();
+    else
+    	ifpid=-1;
+    
+    
+    
+  	for (Integer e1 : entities) {
+      if (done++ < startAt) continue;
+      Announce.progressStep();
+      if (done % reportInterval == 0) {
+        //Announce.message("Entities done:", done, "Time per entity:", timeSum / ((float) reportInterval), "ms     Facts per entity:", factSum / ((float) reportInterval),
+        //    NumberFormatter.formatMS((long) ((double) (System.currentTimeMillis() - timeStart) / (done - startAt) * (total - done))));
+        Announce.message("Entities done:", done, "Time per entity:", (System.currentTimeMillis() - start) / ((float) 1000*1000*reportInterval), "ms",
+            NumberFormatter.formatMS((long) ((double) (System.currentTimeMillis() - timeStart) / (done - startAt) * (total - done))));
+        if (stop.exists()) break;
+      }
+      if (factStore1.isClass(e1) || factStore1.isRelation(e1)) continue;
+      if (done > total) break;
+      if (setting.nThreads == 1){
+        foundEquality |= findEqualsOf(e1, run == 0, aSomeChanged, equalities,labelid,sameasid,ifpid);
+        //DynamicBlock(k,Config.t);
+      }
+      else
+    	 pool.execute(new EntityComputer(aFoundEquality, aSomeChanged, e1, run == 0, equalities,labelid,sameasid,ifpid));
+      /*
+      if (setting.nThreads == 1)
+    	  Block(factStore1.getInstanceSet(),factStore2.getInstanceSet(),k,Config.t);
+      else
+    	  pool.execute(new EntityComputer1());;
+      */
+      
+     }
+  	if (setting.nThreads != 1) {
+	    while (true) {
+    		try {
+					if (pool.await(60, TimeUnit.SECONDS))
+						break;
+				} catch (InterruptedException e) {
+					// continue to wait
+				}
+    		Announce.message("waiting for task termination...");
+	    }
+  	}
+  	 CountAunion();
+     //Set<Pair<Object,Object>> k=new HashSet<Pair<Object,Object>>();
+     if (setting.nThreads == 1){
+    	 Set<Pair<Object,Object>> k=new HashSet<Pair<Object,Object>>();
+   	  	 Block(factStore1.getInstanceSet(),factStore2.getInstanceSet(),k,Config.t);
+     }
+     else
+   	  pool.execute(new EntityComputer1());;
+     //Block(factStore1.getInstanceSet(),factStore2.getInstanceSet(),k,Config.t);
+  	
+  	
+/*
+  	if (setting.nThreads != 1) {
+	    while (true) {
+    		try {
+					if (pool.await(60, TimeUnit.SECONDS))
+						break;
+				} catch (InterruptedException e) {
+					// continue to wait
+				}
+    		Announce.message("waiting for task termination...");
+	    }
+  	}
+  */	
+  	
+  	
+  	
+  	
+    entities.close();
+    Announce.progressDone();
+    Announce.message(foundEquality || aFoundEquality.get() ? "Found equalities" : "Found no equalities");
+    Announce.message("reindexing at", NumberFormatter.ISOtime());
+    Announce.doing("Reindexing equalities and removing duplicates");
+    computed.equalityStore = new MemorySubThingStore(computed.tsvFolder, "eqv_s", run,
+    		factStore1, factStore2, equalities);
+    Announce.done();
+    Announce.message("done equalities at", NumberFormatter.ISOtime());
+    if (stop.exists()) return (false);
+
+
+    computed.equalityStore.dump(new File(setting.tsvFolder, run + "_eqv.tsv"), factStore1, factStore2);
+    Announce.progressDone();
+    Announce.message("done properties at", NumberFormatter.ISOtime());
+
+    return (aSomeChanged.get());
+  }
+
+  /** Computes all subclasses*/
+  public static void computeClasses() throws IOException {
+    if (stop.exists()) return;
+    int counter = factStore2.numClasses();
+    Announce.progressStart("Computing subclasses one direction", counter);
+    PeekIterator<Integer> classes = factStore2.classes();
+    for (Integer cls : classes) {
+      if (stop.exists()) break;
+      findSuperClassesOf(cls, factStore2, factStore1);
+      Announce.progressStep();
+    }
+    classes.close();
+    Announce.progressDone();
+
+    counter = factStore1.numClasses();
+    Announce.progressStart("Computing subclasses other direction", counter);
+    classes = factStore1.classes();
+    for (Integer cls : classes) {
+      if (stop.exists()) break;
+      findSuperClassesOf(cls, factStore1, factStore2);
+      Announce.progressStep();
+    }
+    classes.close();
+    Announce.progressDone();
+  }
+
+
+	private static class FactStoreLoader implements Runnable {
+		MemoryFactStore factStore;
+		File path;
+		String type;
+
+		public FactStoreLoader(File path, String type) {
+			this.path = path;
+			this.type = type;
+			this.factStore = null;
+		}
+
+		public void run() {
+			try {
+				if (type.equals("memory")) {
+					FileInputStream f = new FileInputStream(path);
+					ObjectInputStream of = new ObjectInputStream(f);
+					Object obj = of.readObject();
+					of.close();
+					if (!(obj instanceof MemoryFactStore)) {
+						System.err
+								.printf("Serialized object is not a MemoryFactStore, exiting...\n");
+						System.exit(2);
+					}
+					MemoryFactStore result = (MemoryFactStore) obj;
+					factStore = result;
+					return;
+				}
+				System.err.printf("Bad targetType %s\n", type);
+				assert(false);
+				return;
+			} catch (Exception e) {
+				e.printStackTrace();
+				assert(false);
+			}
+		}
+	}
+	
+
+	static MemoryFactStore loadFactStore(File factStore, String type) {
+		// load with no threading
+		FactStoreLoader factStoreLoader = new FactStoreLoader(factStore, type);
+		factStoreLoader.run();
+		return factStoreLoader.factStore;
+	}
+
+  /**Runs the thing*/
+  public static void main(String[] args) throws Exception {
+	    
+  	// Task: load an ontology
+    if (args.length == 6) {
+	    File sourceFile = new File(args[0]);
+	    String parseType = args[1];
+	    String target = args[2];
+	    String namespace = args[3];
+	    String prefix = args[4];
+      boolean indexShinglings = Boolean.parseBoolean(args[5]);
+	    FactStore factStore = new MemoryFactStore(indexShinglings);
+	    FactLoader factLoader = new FactLoader(
+		    		sourceFile, parseType, factStore, namespace, prefix);
+	  //  FactLoader factLoader = new FactLoader(
+	  //  		sourceFile, parseType, factStore, namespace, prefix,2);
+	    Announce.doing("Loading facts...");
+	    factLoader.run();
+	    Announce.done();
+	    
+	    Announce.doing("Saving...");
+    	FileOutputStream f = new FileOutputStream(target);
+     	ObjectOutputStream of = new ObjectOutputStream(f);
+    	of.writeObject(factStore);
+    	of.close();
+	    
+   		System.exit(0);
+    }
+    
+    // Task: dump ontology entities
+    if (args.length == 2) {
+      File factstore = new File(args[0]);
+      Announce.doing("loading fact store");
+    	factStore1 = loadFactStore(factstore, "memory");
+    	Announce.done();
+    	Announce.doing("dumping entities");
+    	BufferedWriter w = new BufferedWriter(new FileWriter(args[1]));
+    	for (int entity : factStore1.entities()) {
+    		if (factStore1.relation(entity) == null) // don't count relations
+      		w.write(factStore1.entity(entity).toString() + "\n");
+    	}
+    	w.close();
+    	Announce.done();
+	    System.exit(0);
+    }
+    
+    if(args==null || args.length != 1) Announce.help(
+    		"Paris <settingFile>\n",
+    		"You can specify a file that has no content.",
+    		"PARIS will ask for the necessary data and store it in <SettingFile>.\n\n",
+    		"Paris <sourceFile> <parseType> <target> <namespace> <prefix> <shinglings>\n",
+        "Creates a FactStore from a source ontology.",
+        "* <sourceFile> can be an RDF, OWL, NT or TSV file, or a folder containing such files",
+        "* <parseType> can be",
+        "     yagoNative   (for TSV files of the native YAGO2)",
+        "     pierreImdb   (for TSV files in Pierre's format)",
+        "     rdf          (for OWL, RDF, or NT files)",
+        "     SPO          (for TSV files, where the S is the 1-based column number of",
+        "                    the subject, P of the predicate, and O of the object (e.g., 123))",
+        "* <target> is the destination where the data will be stored",
+        "* <namespace> is the namespace of the ontology you load (e.g., http://www.mpii.de/yago/resource/)",
+        "* <prefix> is the prefix by which you want to abbreviate the namespace (e.g., y:)\n",
+        "* <shinglings> is true or false to compute the approximate string index or not\n\n",
+        "Paris <factstore> <dump>\n",
+        "Dump all entities of factstore to dump");
+    
+    // Task: perform the alignment
+    Announce.doing("Starting PARIS");
+    Announce.message("Settings:",args[0]);
+    setting=new Setting(new File(args[0]));    
+
+    // Prepare the folders
+    if (!setting.tsvFolder.exists() && D.readBoolean("Do you want to create the folder " + setting.tsvFolder + "?")) setting.tsvFolder.mkdirs();
+    if (!setting.berkeleyFolder.exists() && D.readBoolean("Do you want to create the folder " + setting.berkeleyFolder + "?")) setting.berkeleyFolder
+        .mkdirs();
+    if(setting.startIteration==0 && setting.startEntity==0) {
+      for (File folder : new File[] { setting.berkeleyFolder, setting.tsvFolder }) {
+        if (folder.list().length > 0 && D.readBoolean("Do you want to DELETE the files in " + folder + " ?")) {
+          Announce.doing("Deleting files in", folder);
+          for (File f : folder.listFiles())
+            f.delete();
+          Announce.done();
+        }
+      }
+    }
+
+    // Set output to the log folder
+    Announce.done();
+    File logFile=new File(setting.home,"run_"+setting.name+"_"+NumberFormatter.timeStamp()+".txt");
+    Announce.message("PARIS is now running.");
+    Announce.message("For information about the current state of affairs, look into");
+    Announce.message("   ",logFile);    
+    Announce.message("To stop this process, create the file");
+    Announce.message("   ", stop);    
+    if (!test) Announce.setWriter(new FileWriter(logFile)); /**/
+
+    Announce.message("PARIS running at", NumberFormatter.ISOtime());
+    Announce.message("@TIME", "startup", System.currentTimeMillis() / 1000L);
+    Config.print();
+
+    long startTime = System.currentTimeMillis();
+
+    Announce.doing("Loading fact stores (could take a long time...)");
+    FactStoreLoader factStoreLoader1 = new FactStoreLoader(setting.ontology1, setting.ontologyType1);
+    FactStoreLoader factStoreLoader2 = new FactStoreLoader(setting.ontology2, setting.ontologyType2);
+		Thread factStoreLoaderThread1 = new Thread(factStoreLoader1);
+		Thread factStoreLoaderThread2 = new Thread(factStoreLoader2);
+    factStoreLoaderThread1.start();
+    factStoreLoaderThread2.start();
+    factStoreLoaderThread1.join();
+    factStoreLoaderThread2.join();
+    factStore1 = factStoreLoader1.factStore;
+    factStore2 = factStoreLoader2.factStore;
+    Announce.done();
+   // HashTable a;
+    computed = new Result(factStore1, factStore2, setting.berkeleyFolder, setting.tsvFolder, true);
+/*
+    if (debug) Announce.setLevel(Level.DEBUG);
+    // ************ If you want to play around, do it in the following {} !
+    if (test) {
+      computed.startIteration(99);
+      Announce.setLevel(Level.DEBUG);
+      debug = true;
+      AtomicBoolean f = new AtomicBoolean();
+      MemoryEqualityStore m = null;
+      factStore1.debugEntity("Zac_Alcorn");
+      factStore2.debugEntity("dbp:resource/Zac_Alcorn");
+      findEqualsOf(factStore1.entity("Zac_Alcorn").id, true, 	f, m,-1,-1,-1);
+      factStore1.close();
+      factStore2.close();
+      computed.close();
+      D.exit();
+    }
+    */
+    Announce.message("Factstores loaded at", NumberFormatter.ISOtime());
+    Announce.message("To stop this process, create the file");
+    Announce.message("   ", stop);
+    for (int i = setting.startIteration; i < setting.endIteration; i++) {
+    	Announce.message("@TIME", i+1, System.currentTimeMillis() / 1000L);
+      if (stop.exists()) break;
+      if (!oneIteration(i, setting.startEntity)) break;
+      setting.startEntity = 0;
+    }
+    Announce.message("@TIME", setting.endIteration + 1, System.currentTimeMillis() / 1000L);
+    computed.startIteration(setting.endIteration);
+    Announce.message("@TIME", "classes", System.currentTimeMillis() / 1000L);
+    Announce.message("computing classes at", NumberFormatter.ISOtime());
+    //computeClasses(); 
+    Announce.message("computed classes at", NumberFormatter.ISOtime());
+    computed.print(); 
+    factStore1.close();
+    factStore2.close();
+    computed.close();
+    if (stop.exists()) Announce.message("Stopped because found", stop);
+    System.out.printf("PARIS terminated after %d milliseconds\n",
+    		System.currentTimeMillis() - startTime);
+    Announce.message("@TIME", "shutdown", System.currentTimeMillis() / 1000L);
+    Announce.close();
+  }
+}
+
